@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Chewy</string>
+    <string name="blocker_service_description">Chewy checks which app is in front to show your chosen pause screen. It does not read screen content or send app activity to a server.</string>
+</resources>
