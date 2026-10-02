@@ -3,12 +3,15 @@ import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {Alert, Animated, AppState, PanResponder, Pressable, ScrollView, StyleSheet, View} from 'react-native';
 import Svg, {Circle, Path, Rect} from 'react-native-svg';
 import {Text} from './AppText';
+import {CompactThemePicker} from './ThemePicker';
 import {defaultTimerSettings, loadTimerSettings, timerKeys, timerOptions} from './focusSettings';
 import type {TimerSetting, TimerSettings} from './focusSettings';
 import {blocker, emptyStatus} from './native/blocker';
 import type {BlockerStatus} from './native/blocker';
+import {boundaryState} from './blockStatus';
 import {clearFocusRecords, collectExpiredFocusSession} from './progress';
-import {cartoon, colors} from './theme';
+import {DAILY_GOAL_OPTIONS, DEFAULT_DAILY_GOAL, loadDailyGoal, saveDailyGoal} from './dailyGoal';
+import {cartoon, colors, themePalettes, type ThemeMode} from './theme';
 
 type IconName = TimerSetting | 'apps' | 'service' | 'replay' | 'clear';
 
@@ -132,26 +135,31 @@ function SettingsRow({icon, title, detail, value, onPress, destructive = false}:
   </Pressable>;
 }
 
-export function SettingsScreen({onReplay, onOpenBlock}: {onReplay: () => void; onOpenBlock: () => void}) {
+export function SettingsScreen({theme, onThemeChange, onReplay, onOpenBlock}: {theme: ThemeMode; onThemeChange: (theme: ThemeMode) => Promise<void>; onReplay: () => void; onOpenBlock: () => void}) {
   const [timerSettings, setTimerSettings] = useState<TimerSettings>(defaultTimerSettings);
   const [status, setStatus] = useState<BlockerStatus>(emptyStatus);
   const [expandedTimer, setExpandedTimer] = useState<TimerSetting | null>('focus');
+  const [dailyGoal, setDailyGoal] = useState(DEFAULT_DAILY_GOAL);
+  const boundary = boundaryState(status, Boolean(blocker));
 
   const refresh = useCallback(async () => {
     try {
-      const [savedSettings, nextStatus] = await Promise.all([
+      const [savedSettings, nextStatus, goal] = await Promise.all([
         loadTimerSettings(),
         blocker ? blocker.getStatus() : Promise.resolve(emptyStatus),
+        loadDailyGoal(),
       ]);
       setTimerSettings(savedSettings);
       setStatus(nextStatus);
+      setDailyGoal(goal);
     } catch (reason) { Alert.alert('Could not load settings', String(reason)); }
   }, []);
 
   useEffect(() => {
     refresh();
     const subscription = AppState.addEventListener('change', state => {if (state === 'active') refresh();});
-    return () => subscription.remove();
+    const timer = setInterval(() => {blocker?.getStatus().then(setStatus).catch(() => {});}, 30000);
+    return () => {subscription.remove(); clearInterval(timer);};
   }, [refresh]);
 
   async function chooseTimerValue(kind: TimerSetting, value: number) {
@@ -162,6 +170,16 @@ export function SettingsScreen({onReplay, onOpenBlock}: {onReplay: () => void; o
     } catch (reason) {
       setTimerSettings(current => ({...current, [kind]: previous}));
       Alert.alert('Could not save timer setting', String(reason));
+    }
+  }
+
+  async function chooseDailyGoal(value: number) {
+    const previous = dailyGoal;
+    setDailyGoal(value);
+    try { await saveDailyGoal(value); }
+    catch (reason) {
+      setDailyGoal(previous);
+      Alert.alert('Could not save daily goal', String(reason));
     }
   }
 
@@ -187,16 +205,23 @@ export function SettingsScreen({onReplay, onOpenBlock}: {onReplay: () => void; o
   }
 
   return <>
-    <ScrollView style={styles.screen} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+    <ScrollView style={[styles.screen, {backgroundColor: themePalettes[theme].screen}]} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
       <Text style={styles.eyebrow}>MAKE IT YOURS</Text>
       <Text style={styles.heading}>Settings</Text>
+      <Text style={styles.sectionTitle}>Daily goal</Text>
+      <View style={styles.goalCard}>
+        <Text style={styles.goalDescription}>Time you aim to stay under in your selected apps each day. Chewy energy reaches 50 at this goal.</Text>
+        <View style={styles.goalOptions}>{DAILY_GOAL_OPTIONS.map(minutes => <Pressable key={minutes} onPress={() => chooseDailyGoal(minutes)} accessibilityRole="radio" accessibilityState={{selected: dailyGoal === minutes}} style={[styles.goalOption, dailyGoal === minutes && styles.goalOptionSelected]}><Text style={[styles.goalOptionText, dailyGoal === minutes && styles.goalOptionTextSelected]}>{minutes < 60 ? `${minutes}m` : `${minutes / 60}h`}</Text></Pressable>)}</View>
+      </View>
+      <Text style={styles.sectionTitle}>Appearance</Text>
+      <CompactThemePicker value={theme} onChange={mode => onThemeChange(mode).catch(reason => Alert.alert('Could not save theme', String(reason)))} />
       <Text style={styles.sectionCaption}>Edit time</Text>
       {(['focus', 'shortBreak', 'longBreak', 'sessions'] as TimerSetting[]).map(kind => <TimerSettingCard key={kind} kind={kind} value={timerSettings[kind]} expanded={expandedTimer === kind} onToggle={() => setExpandedTimer(current => current === kind ? null : kind)} onChange={value => chooseTimerValue(kind, value)} />)}
 
       <Text style={styles.sectionTitle}>General</Text>
       <Text style={styles.sectionSubhead}>App boundaries</Text>
       <View style={styles.sectionCard}><SettingsRow icon="apps" title="Manage blocked apps" detail="Choose what Chewy pauses" value={blocker ? `${status.blockedPackages.length} selected` : 'Android only'} onPress={onOpenBlock} /><View style={styles.divider} /><SettingsRow icon="service" title="Android service" detail="Needed for app pause screens" value={blocker ? status.accessibilityEnabled ? 'Enabled' : 'Off' : 'Unavailable'} onPress={() => blocker?.openAccessibilitySettings()} /></View>
-      <View style={styles.statusCard}><View style={[styles.statusDot, status.blockingEnabled && status.accessibilityEnabled && styles.statusDotOn]} /><Text style={styles.statusText}>{blocker ? status.blockingEnabled && status.accessibilityEnabled ? 'App boundaries are active' : 'App boundaries are currently off' : 'App boundaries are available on Android'}</Text></View>
+      <View style={styles.statusCard}><View style={[styles.statusDot, boundary.active && styles.statusDotOn]} /><View style={styles.statusCopy}><Text style={styles.statusText}>{boundary.label}</Text><Text style={styles.statusDetail}>{boundary.detail}</Text></View></View>
 
       <Text style={styles.sectionTitle}>Your Chewy</Text>
       <View style={styles.sectionCard}><SettingsRow icon="replay" title="Replay onboarding" detail="See the welcome flow again" onPress={confirmReplay} /><View style={styles.divider} /><SettingsRow icon="clear" title="Clear progress history" detail="Remove saved sessions and pause counts" onPress={confirmClearProgress} destructive /></View>
@@ -208,11 +233,18 @@ export function SettingsScreen({onReplay, onOpenBlock}: {onReplay: () => void; o
 }
 
 const styles = StyleSheet.create({
+  goalCard: {borderWidth: 2, borderBottomWidth: 5, borderColor: colors.green, borderRadius: 23, padding: 16, backgroundColor: colors.surface, gap: 12},
+  goalDescription: {fontSize: 12, lineHeight: 18, color: colors.ink},
+  goalOptions: {flexDirection: 'row', flexWrap: 'wrap', gap: 8},
+  goalOption: {paddingHorizontal: 13, paddingVertical: 9, borderRadius: 15, borderWidth: 1.5, borderColor: colors.green, backgroundColor: cartoon.mint},
+  goalOptionSelected: {backgroundColor: colors.green},
+  goalOptionText: {fontSize: 12, fontWeight: '800', color: colors.green},
+  goalOptionTextSelected: {color: colors.background},
   screen: {flex: 1, backgroundColor: colors.background}, content: {paddingHorizontal: 20, paddingTop: 22, paddingBottom: 40, gap: 13}, eyebrow: {fontSize: 12, fontWeight: '800', letterSpacing: 2.2, color: colors.green}, heading: {fontSize: 31, fontWeight: '900', color: colors.ink, marginBottom: 6}, sectionCaption: {alignSelf: 'flex-start', fontSize: 13, fontWeight: '800', color: colors.green, backgroundColor: cartoon.sunshine, borderRadius: 13, paddingHorizontal: 11, paddingVertical: 5, overflow: 'hidden', marginBottom: 3},
   timerCard: {borderWidth: 2, borderBottomWidth: 4, borderColor: colors.green, borderRadius: 24, backgroundColor: colors.surface, overflow: 'hidden'}, timerRow: {height: 64, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', gap: 12}, timerIconBadge: {width: 36, height: 36, borderRadius: 12, borderWidth: 1.5, borderColor: colors.green, backgroundColor: cartoon.mint, alignItems: 'center', justifyContent: 'center'}, timerName: {flex: 1, fontSize: 15, fontWeight: '800', color: colors.ink}, timerValue: {fontSize: 14, fontWeight: '800', color: colors.green},
   sliderArea: {paddingHorizontal: 20, paddingBottom: 17}, sliderHint: {fontSize: 11, color: colors.muted, marginBottom: 4}, sliderTouch: {height: 46, justifyContent: 'center'}, sliderTrack: {height: 14, borderRadius: 8, backgroundColor: '#dcefe5'}, sliderFill: {height: 14, borderRadius: 8, backgroundColor: '#21ad81'}, sliderThumb: {position: 'absolute', top: -6, width: 26, height: 26, borderRadius: 13, backgroundColor: cartoon.sunshine, borderWidth: 3, borderColor: colors.green, transform: [{translateX: -13}]}, sliderLabels: {flexDirection: 'row', justifyContent: 'space-between'}, sliderLabel: {fontSize: 11, color: colors.muted},
   sectionSubhead: {fontSize: 15, fontWeight: '700', color: colors.ink, marginTop: 5},
   sectionTitle: {fontSize: 19, fontWeight: '900', color: colors.ink, marginTop: 10}, sectionCard: {borderWidth: 2, borderBottomWidth: 5, borderColor: colors.green, borderRadius: 24, backgroundColor: colors.surface, paddingHorizontal: 14, overflow: 'hidden'}, row: {minHeight: 73, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10}, iconBadge: {width: 42, height: 42, borderRadius: 15, borderWidth: 1.5, borderColor: colors.green, backgroundColor: cartoon.mint, alignItems: 'center', justifyContent: 'center'}, rowCopy: {flex: 1}, rowTitle: {fontSize: 14, fontWeight: '800', color: colors.ink}, destructive: {color: '#b65352'}, rowDetail: {fontSize: 11, lineHeight: 16, color: colors.muted, marginTop: 3}, rowValue: {fontSize: 11, fontWeight: '800', color: colors.green, textAlign: 'right'}, divider: {height: 1.5, backgroundColor: '#cce5d9', marginLeft: 54},
-  statusCard: {backgroundColor: cartoon.sunshine, borderWidth: 2, borderColor: colors.green, borderRadius: 24, minHeight: 48, flexDirection: 'row', alignItems: 'center', gap: 9, paddingHorizontal: 15}, statusDot: {width: 8, height: 8, borderRadius: 4, backgroundColor: '#a2aaa5'}, statusDotOn: {backgroundColor: colors.green}, statusText: {fontSize: 12, fontWeight: '800', color: colors.ink},
+  statusCard: {backgroundColor: cartoon.sunshine, borderWidth: 2, borderColor: colors.green, borderRadius: 24, minHeight: 60, flexDirection: 'row', alignItems: 'center', gap: 9, paddingHorizontal: 15, paddingVertical: 10}, statusDot: {width: 8, height: 8, borderRadius: 4, backgroundColor: '#a2aaa5'}, statusDotOn: {backgroundColor: colors.green}, statusCopy: {flex: 1, gap: 3}, statusText: {fontSize: 12, fontWeight: '800', color: colors.ink}, statusDetail: {fontSize: 11, lineHeight: 15, color: colors.muted},
   privacyCard: {backgroundColor: cartoon.lilac, borderWidth: 2, borderBottomWidth: 5, borderColor: colors.green, borderRadius: 24, padding: 18, gap: 8, marginTop: 5}, privacyTitle: {fontSize: 15, fontWeight: '900', color: colors.ink}, privacyBody: {fontSize: 12, lineHeight: 19, color: colors.ink},
 });

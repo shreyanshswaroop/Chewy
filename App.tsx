@@ -2,25 +2,37 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import React, {useEffect, useRef, useState} from 'react';
 import {Animated, StatusBar, StyleSheet, View} from 'react-native';
 import {SafeAreaProvider, useSafeAreaInsets} from 'react-native-safe-area-context';
-import {MainTabs, homeGround, homeSky} from './src/MainTabs';
+import {MainTabs} from './src/MainTabs';
 import {Onboarding} from './src/Onboarding';
-import {colors} from './src/theme';
+import {themePalettes, type ThemeMode} from './src/theme';
 
 const ONBOARDING_KEY = 'chewy.onboardingComplete';
+const THEME_KEY = 'chewy.theme';
 
 function ChewyRoot() {
   const insets = useSafeAreaInsets();
   const [completed, setCompleted] = useState<boolean | null>(null);
-  const [tabBackground, setTabBackground] = useState(colors.background);
+  const [theme, setTheme] = useState<ThemeMode>('day');
+  const [tabBackground, setTabBackground] = useState<string | null>(null);
   const homeScrollY = useRef(new Animated.Value(0)).current;
   useEffect(() => {
-    AsyncStorage.getItem(ONBOARDING_KEY)
-      .then(value => setCompleted(value === 'true'))
+    Promise.all([AsyncStorage.getItem(ONBOARDING_KEY), AsyncStorage.getItem(THEME_KEY)])
+      .then(([complete, savedTheme]) => {
+        if (savedTheme === 'day' || savedTheme === 'evening' || savedTheme === 'forest' || savedTheme === 'night') setTheme(savedTheme);
+        setCompleted(complete === 'true');
+      })
       .catch(() => setCompleted(false));
   }, []);
 
+  async function changeTheme(nextTheme: ThemeMode) {
+    await AsyncStorage.setItem(THEME_KEY, nextTheme);
+    setTheme(nextTheme);
+  }
+
   async function finishOnboarding() {
     await AsyncStorage.setItem(ONBOARDING_KEY, 'true');
+    setTabBackground(null);
+    homeScrollY.setValue(0);
     setCompleted(true);
   }
   async function replayOnboarding() {
@@ -28,17 +40,20 @@ function ChewyRoot() {
     setCompleted(false);
   }
 
-  return <View style={{flex: 1, backgroundColor: completed ? (tabBackground === homeSky ? homeGround : tabBackground) : colors.background, paddingTop: insets.top, paddingBottom: insets.bottom}}>
-    {completed && tabBackground === homeSky && <Animated.View pointerEvents="none" style={[styles.homeStatusSky, {height: insets.top, opacity: homeScrollY.interpolate({inputRange: [160, 230], outputRange: [1, 0], extrapolate: 'clamp'})}]} />}
-    <StatusBar barStyle="dark-content" />
+  const palette = themePalettes[theme];
+  const onHome = tabBackground === palette.sky || (tabBackground === null && completed);
+  const rootStyle = {flex: 1, backgroundColor: completed ? (onHome ? palette.ground : tabBackground ?? palette.screen) : '#9be5f4', paddingTop: completed ? insets.top : 0, paddingBottom: completed ? insets.bottom : 0};
+  return <View style={rootStyle}>
+    {completed && onHome && <Animated.View pointerEvents="none" style={[styles.homeStatusSky, {height: insets.top, backgroundColor: palette.sky, opacity: homeScrollY.interpolate({inputRange: [160, 230], outputRange: [1, 0], extrapolate: 'clamp'})}]} />}
+    <StatusBar barStyle={completed && onHome ? palette.statusBar : 'dark-content'} />
     {completed === null ? null : completed
-      ? <MainTabs onReplay={replayOnboarding} onBackgroundChange={setTabBackground} homeScrollY={homeScrollY} />
-      : <Onboarding onComplete={finishOnboarding} />}
+      ? <MainTabs theme={theme} onThemeChange={changeTheme} onReplay={replayOnboarding} onBackgroundChange={setTabBackground} homeScrollY={homeScrollY} />
+      : <Onboarding initialTheme={theme} onComplete={finishOnboarding} />}
   </View>;
 }
 
 const styles = StyleSheet.create({
-  homeStatusSky: {position: 'absolute', top: 0, left: 0, right: 0, backgroundColor: homeSky},
+  homeStatusSky: {position: 'absolute', top: 0, left: 0, right: 0},
 });
 
 export default function App() {

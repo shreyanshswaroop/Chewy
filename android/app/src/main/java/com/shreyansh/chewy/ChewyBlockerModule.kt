@@ -1,7 +1,6 @@
 package com.shreyansh.chewy
 
 import android.app.AppOpsManager
-import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -72,6 +71,18 @@ class ChewyBlockerModule(private val context: ReactApplicationContext) :
     }
     result.putBoolean("accessibilityEnabled", serviceEnabled)
     result.putBoolean("blockingEnabled", serviceEnabled && blockingEnabled)
+    result.putBoolean("focusBlocking", serviceEnabled &&
+      prefs.getLong(ChewyBlockerService.FOCUS_BLOCK_UNTIL, 0L) > System.currentTimeMillis() &&
+      prefs.getStringSet(ChewyBlockerService.BLOCKED_PACKAGES, emptySet()).orEmpty().isNotEmpty())
+    val rules = ChewyRules.load(context)
+    val usageGranted = ChewyUsage.permitted(context)
+    result.putBoolean("usageAccessGranted", usageGranted)
+    result.putInt("dailyAllowanceMinutes", rules.dailyAllowanceMinutes)
+    result.putBoolean("scheduleActive", serviceEnabled && rules.activeSchedule() &&
+      prefs.getStringSet(ChewyBlockerService.BLOCKED_PACKAGES, emptySet()).orEmpty().isNotEmpty())
+    result.putBoolean("allowanceReached", serviceEnabled && usageGranted && rules.dailyAllowanceMinutes > 0 &&
+      prefs.getStringSet(ChewyBlockerService.BLOCKED_PACKAGES, emptySet()).orEmpty().isNotEmpty() &&
+      ChewyUsage.selectedTime(context, ChewyUsage.dayStart(), System.currentTimeMillis()) >= rules.dailyAllowanceMinutes * 60000L)
     val packages = Arguments.createArray()
     prefs.getStringSet(ChewyBlockerService.BLOCKED_PACKAGES, emptySet())
       ?.sorted()?.forEach { packages.pushString(it) }
@@ -89,6 +100,7 @@ class ChewyBlockerModule(private val context: ReactApplicationContext) :
       ) == AppOpsManager.MODE_ALLOWED
       result.putBoolean("permissionGranted", permitted)
       result.putDouble("totalTimeMs", 0.0)
+      result.putDouble("selectedTimeMs", 0.0)
       val topApps = Arguments.createArray()
       if (!permitted) {
         result.putArray("topApps", topApps)
@@ -106,17 +118,18 @@ class ChewyBlockerModule(private val context: ReactApplicationContext) :
         set(Calendar.SECOND, 0)
         set(Calendar.MILLISECOND, 0)
       }.timeInMillis
-      val manager = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-      val usage = manager.queryAndAggregateUsageStats(start, System.currentTimeMillis())
-        .mapNotNull { (packageName, stats) ->
+      val summary = ChewyUsage.usageSummary(context, listOf(start), System.currentTimeMillis())
+      val usage = summary.packageTime
+        .mapNotNull { (packageName, duration) ->
           val app = launchable[packageName] ?: return@mapNotNull null
-          if (ChewyBlockerService.isProtectedPackage(context, packageName) || stats.totalTimeInForeground <= 0L) {
+          if (ChewyBlockerService.isProtectedPackage(context, packageName) || duration <= 0L) {
             return@mapNotNull null
           }
-          app to stats.totalTimeInForeground
+          app to duration
         }
         .sortedByDescending { it.second }
       result.putDouble("totalTimeMs", usage.sumOf { it.second }.toDouble())
+      result.putDouble("selectedTimeMs", (summary.selectedByDay.firstOrNull() ?: 0L).toDouble())
       usage.take(3).forEach { (app, timeMs) ->
         val item = Arguments.createMap()
         item.putString("packageName", app.activityInfo.packageName)
@@ -130,6 +143,68 @@ class ChewyBlockerModule(private val context: ReactApplicationContext) :
     } catch (error: Exception) {
       promise.reject("USAGE_STATS_FAILED", error)
     }
+  }
+
+  @ReactMethod
+  fun getWeeklySelectedUsage(promise: Promise) {
+    try {
+      val result = Arguments.createMap()
+      val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+      val permitted = appOps.checkOpNoThrow(
+        AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.packageName
+      ) == AppOpsManager.MODE_ALLOWED
+      result.putBoolean("permissionGranted", permitted)
+      val days = Arguments.createArray()
+      if (permitted) {
+        val today = Calendar.getInstance().apply {
+          set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+          set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+        }
+        val trackingStartedAt = ChewyUsage.startedAt(context)
+        result.putDouble("trackingStartedAt", trackingStartedAt.toDouble())
+        val dayStarts = (14 downTo 0).map { offset ->
+          (today.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, -offset) }.timeInMillis
+        }
+        val totals = ChewyUsage.selectedTimeByDay(context, dayStarts, System.currentTimeMillis())
+        dayStarts.forEachIndexed { index, start ->
+          val offset = 14 - index
+          val item = Arguments.createMap()
+          item.putDouble("dayStart", start.toDouble())
+          item.putDouble("selectedTimeMs", totals[index].toDouble())
+          item.putBoolean("completeTracking", offset > 0 && trackingStartedAt > 0 && trackingStartedAt <= start)
+          days.pushMap(item)
+        }
+      }
+      result.putArray("days", days)
+      promise.resolve(result)
+    } catch (error: Exception) {
+      promise.reject("WEEKLY_USAGE_FAILED", error)
+    }
+  }
+
+  @ReactMethod
+  fun getRules(promise: Promise) {
+    promise.resolve(ChewyRules.load(context).json())
+  }
+
+  @ReactMethod
+  fun saveRules(raw: String, promise: Promise) {
+    try {
+      val validated = ChewyRules.parse(raw)
+      context.getSharedPreferences(ChewyBlockerService.PREFS, 0)
+        .edit().putString(ChewyRules.KEY, validated.json()).apply()
+      promise.resolve(null)
+    } catch (error: Exception) {
+      promise.reject("INVALID_RULES", error)
+    }
+  }
+
+  @ReactMethod
+  fun setFocusBlockUntil(timestamp: Double, promise: Promise) {
+    val until = if (timestamp.isFinite() && timestamp > System.currentTimeMillis()) timestamp.toLong() else 0L
+    context.getSharedPreferences(ChewyBlockerService.PREFS, 0)
+      .edit().putLong(ChewyBlockerService.FOCUS_BLOCK_UNTIL, until).apply()
+    promise.resolve(null)
   }
 
   @ReactMethod
@@ -173,6 +248,7 @@ class ChewyBlockerModule(private val context: ReactApplicationContext) :
           selected.add(packageName)
         }
       }
+      ChewyUsage.recordSelection(context, selected)
       context.getSharedPreferences(ChewyBlockerService.PREFS, 0)
         .edit().putStringSet(ChewyBlockerService.BLOCKED_PACKAGES, selected).apply()
       promise.resolve(null)

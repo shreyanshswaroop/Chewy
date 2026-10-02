@@ -4,10 +4,11 @@ import {Animated, Modal, Pressable, ScrollView, StyleSheet, TextInput, View} fro
 import Svg, {Circle, Ellipse, Path, Rect} from 'react-native-svg';
 import {Text, appFontFamily} from './AppText';
 import {ChewyCharacter} from './ChewyCharacter';
+import {blocker} from './native/blocker';
 import {FOCUS_DURATION_KEY, LONG_BREAK_KEY, SHORT_BREAK_KEY, timerOptions, loadTimerSettings} from './focusSettings';
 import {collectExpiredFocusSession} from './progress';
 import type {TimerMode} from './progress';
-import {cartoon, colors} from './theme';
+import {cartoon, colors, themePalettes, type ThemeMode} from './theme';
 
 const END_KEY = 'chewy.focusEndsAt';
 const ACTIVE_DURATION_KEY = 'chewy.activeFocusDuration';
@@ -109,7 +110,7 @@ function PlusIcon() {
   </Svg>;
 }
 
-export function FocusScreen() {
+export function FocusScreen({theme = 'day'}: {theme?: ThemeMode}) {
   const [mode, setMode] = useState<TimerMode>('focus');
   const [duration, setDuration] = useState(25);
   const [shortBreakDuration, setShortBreakDuration] = useState(10);
@@ -121,12 +122,27 @@ export function FocusScreen() {
   const [taskDraft, setTaskDraft] = useState('');
   const [taskDone, setTaskDone] = useState(false);
   const [taskEditor, setTaskEditor] = useState(false);
+  const [focusShieldActive, setFocusShieldActive] = useState(false);
+  const [focusReady, setFocusReady] = useState(false);
 
   useEffect(() => {
     let mounted = true;
+    blocker?.getStatus().then(status => {
+      if (mounted) setFocusReady(status.accessibilityEnabled && status.blockedPackages.length > 0);
+    }).catch(() => {});
     collectExpiredFocusSession().then(() => Promise.all([loadTimerSettings(), ...[END_KEY, PAUSED_KEY, MODE_KEY, TASK_KEY].map(key => AsyncStorage.getItem(key))])).then(([settings, end, paused, savedMode, savedTask]) => {
       if (!mounted) return;
-      if (end && Number(end) > Date.now()) setEndsAt(Number(end));
+      if (end && Number(end) > Date.now()) {
+        setEndsAt(Number(end));
+        const nativeBlocker = blocker;
+        if (savedMode === 'focus' && nativeBlocker) {
+          nativeBlocker.getStatus().then(status => {
+            if (status.accessibilityEnabled && status.blockedPackages.length > 0) {
+              return nativeBlocker.setFocusBlockUntil(Number(end)).then(() => { if (mounted) setFocusShieldActive(true); });
+            }
+          }).catch(() => {});
+        }
+      }
       setDuration(settings.focus);
       setShortBreakDuration(settings.shortBreak);
       setLongBreakDuration(settings.longBreak);
@@ -154,6 +170,7 @@ export function FocusScreen() {
       collectExpiredFocusSession().then(nextMode => {
         setEndsAt(null);
         setPausedSeconds(null);
+        setFocusShieldActive(false);
         if (nextMode) setMode(nextMode);
       });
     }
@@ -168,12 +185,24 @@ export function FocusScreen() {
     setEndsAt(end);
     setPausedSeconds(null);
     await Promise.all([AsyncStorage.setItem(END_KEY, String(end)), AsyncStorage.setItem(MODE_KEY, mode), AsyncStorage.removeItem(PAUSED_KEY)]);
+    if (blocker && mode === 'focus') {
+      try {
+        const status = await blocker.getStatus();
+        setFocusReady(status.accessibilityEnabled && status.blockedPackages.length > 0);
+        if (status.accessibilityEnabled && status.blockedPackages.length > 0) {
+          await blocker.setFocusBlockUntil(end);
+          setFocusShieldActive(true);
+        } else setFocusShieldActive(false);
+      } catch { setFocusShieldActive(false); }
+    }
   }
 
   async function pauseSession() {
     setPausedSeconds(seconds);
     setEndsAt(null);
     await Promise.all([AsyncStorage.setItem(PAUSED_KEY, String(seconds)), AsyncStorage.removeItem(END_KEY)]);
+    if (blocker) await blocker.setFocusBlockUntil(0);
+    setFocusShieldActive(false);
   }
 
   async function finishSession() {
@@ -184,6 +213,8 @@ export function FocusScreen() {
     setEndsAt(null);
     setPausedSeconds(null);
     await Promise.all([AsyncStorage.removeItem(END_KEY), AsyncStorage.removeItem(PAUSED_KEY), AsyncStorage.removeItem(ACTIVE_DURATION_KEY)]);
+    if (blocker) await blocker.setFocusBlockUntil(0);
+    setFocusShieldActive(false);
   }
 
   async function changeMode(next: TimerMode) {
@@ -223,11 +254,12 @@ export function FocusScreen() {
     else AsyncStorage.removeItem(TASK_KEY);
   }
 
-  return <View style={styles.screen}>
+  return <View style={[styles.screen, {backgroundColor: themePalettes[theme].focus}]}>
     <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
       <FocusScene mode={mode} minutes={selectedMinutes} />
       <Text style={styles.artworkTitle}>{artworkTitle}</Text>
       <Pressable style={styles.timeWrap} onPress={cycleDuration} accessibilityRole="button" accessibilityLabel={running ? `${timeText} remaining` : `${timeText}, tap to change duration`}><Text style={styles.timerText}>{timeText}</Text><View style={styles.timerUnderline} />{!running && !paused && <Text style={styles.timeHint}>Tap time to change</Text>}{paused && <Text style={styles.timeHint}>Paused</Text>}</Pressable>
+      {blocker && mode === 'focus' && <Text style={styles.shieldHint}>{focusShieldActive && running ? 'Your selected apps are paused until Focus ends.' : focusReady ? 'Starting Focus will pause your selected apps.' : 'To pause apps during Focus, select them in Block and enable Chewy’s Android service.'}</Text>}
       <View style={styles.controls}>
         <TimerControlButton name="skip" onPress={skipToNext} label={mode === 'focus' ? 'Skip to break' : 'Skip to focus'} />
         <TimerControlButton name={running ? 'pause' : 'play'} onPress={running ? pauseSession : startOrResume} label={running ? 'Pause timer' : paused ? 'Resume timer' : 'Start timer'} />
@@ -249,6 +281,7 @@ const styles = StyleSheet.create({
   screen: {flex: 1, backgroundColor: colors.focusBackground}, content: {paddingHorizontal: 22, paddingTop: 18, paddingBottom: 30},
   scene: {height: 205, marginTop: 36, alignItems: 'center', overflow: 'hidden'}, mascot: {position: 'absolute', top: 27, alignSelf: 'center'}, artworkTitle: {fontSize: 15, fontWeight: '800', color: colors.green, textAlign: 'center', alignSelf: 'center', marginTop: 4, backgroundColor: cartoon.sunshine, borderWidth: 1.5, borderColor: colors.green, borderRadius: 16, paddingHorizontal: 14, paddingVertical: 7, overflow: 'hidden'},
   timeWrap: {alignItems: 'center', justifyContent: 'center', minHeight: 137, marginTop: 5}, timerText: {fontSize: 71, fontWeight: '900', color: colors.green, fontVariant: ['tabular-nums']}, timerUnderline: {width: 126, height: 7, borderRadius: 5, backgroundColor: cartoon.sunshine, marginTop: -8, marginBottom: 9}, timeHint: {fontSize: 12, fontWeight: '700', color: colors.muted},
+  shieldHint: {alignSelf: 'center', maxWidth: 290, marginTop: 8, fontSize: 12, lineHeight: 18, fontWeight: '700', color: colors.muted, textAlign: 'center'},
   controls: {flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 24, marginTop: 28}, timerControl: {width: 62, height: 62, alignItems: 'center', justifyContent: 'center'}, timerControlIcon: {width: 56, height: 56, alignItems: 'center', justifyContent: 'center'},
   taskCard: {marginTop: 27, minHeight: 86, borderRadius: 25, borderWidth: 2, borderBottomWidth: 5, borderColor: colors.green, backgroundColor: cartoon.mint, paddingHorizontal: 18, flexDirection: 'row', alignItems: 'center', gap: 12}, taskIcon: {width: 45, alignItems: 'center'}, taskCopy: {flex: 1}, taskTitle: {fontSize: 15, fontWeight: '800', color: colors.ink}, taskHint: {fontSize: 12, color: colors.muted, marginTop: 4},
   addTask: {height: 58, marginTop: 12, borderRadius: 25, borderWidth: 2, borderBottomWidth: 4, borderColor: colors.green, backgroundColor: cartoon.sunshine, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12}, plusCircle: {width: 32, height: 32, borderRadius: 16, borderWidth: 1.5, borderColor: colors.green, backgroundColor: colors.surface, alignItems: 'center', justifyContent: 'center'}, addTaskText: {fontSize: 18, fontWeight: '800', color: colors.green},

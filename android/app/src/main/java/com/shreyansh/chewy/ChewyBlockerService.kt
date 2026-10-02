@@ -22,12 +22,23 @@ class ChewyBlockerService : AccessibilityService() {
   private val main = Handler(Looper.getMainLooper())
   private var shield: View? = null
   private var shieldedPackage: String? = null
+  private var foregroundPackage: String? = null
+  private var scheduledFocusUntil = 0L
+  private var focusExpiryCheck: Runnable? = null
+  private var heartbeat: Runnable? = null
   private val windows by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
   private val appTypeface by lazy { Typeface.createFromAsset(assets, "fonts/PlusJakartaSans.ttf") }
 
   override fun onAccessibilityEvent(event: AccessibilityEvent?) {
     val packageName = event?.packageName?.toString() ?: return
-    if (packageName == this.packageName && shield != null) return
+    if (packageName == this.packageName && shield != null && event.className?.toString() != MainActivity::class.java.name) return
+    foregroundPackage = packageName
+    evaluate(packageName)
+  }
+
+  private fun evaluate(packageName: String) {
+    heartbeat?.let { main.removeCallbacks(it) }
+    heartbeat = null
     if (isProtectedPackage(this, packageName)) {
       removeShield()
       return
@@ -35,18 +46,43 @@ class ChewyBlockerService : AccessibilityService() {
 
     val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
     val selected = prefs.getStringSet(BLOCKED_PACKAGES, emptySet()).orEmpty()
-    if (prefs.getBoolean(ENABLED, false) && packageName in selected) {
+    if (packageName in selected) {
+      val check = Runnable { if (foregroundPackage == packageName) evaluate(packageName) }
+      heartbeat = check
+      main.postDelayed(check, 30_000L)
+    }
+    val now = System.currentTimeMillis()
+    val focusUntil = prefs.getLong(FOCUS_BLOCK_UNTIL, 0L)
+    val bypassUntil = prefs.getLong(BYPASS_UNTIL, 0L)
+    val bypassed = packageName == prefs.getString(BYPASS_PACKAGE, null) && bypassUntil > now
+    val allDay = prefs.getBoolean(ENABLED, false)
+    val rules = ChewyRules.load(this)
+    val scheduled = rules.activeSchedule()
+    val allowanceReached = !allDay && focusUntil <= now && !scheduled &&
+      rules.dailyAllowanceMinutes > 0 && ChewyUsage.permitted(this) &&
+      ChewyUsage.selectedTime(this, ChewyUsage.dayStart(now), now) >= rules.dailyAllowanceMinutes * 60000L
+    if ((allDay || focusUntil > now || scheduled || allowanceReached) && packageName in selected && !bypassed) {
       showShield(packageName)
+      if (focusUntil > now && !allDay && scheduledFocusUntil != focusUntil) {
+        focusExpiryCheck?.let { main.removeCallbacks(it) }
+        val check = Runnable { if (foregroundPackage == packageName) evaluate(packageName) }
+        focusExpiryCheck = check
+        scheduledFocusUntil = focusUntil
+        main.postDelayed(check, focusUntil - now + 50)
+      }
     } else {
       removeShield()
     }
   }
 
   override fun onInterrupt() {
+    heartbeat?.let { main.removeCallbacks(it) }
     removeShield()
   }
 
   override fun onDestroy() {
+    heartbeat?.let { main.removeCallbacks(it) }
+    focusExpiryCheck?.let { main.removeCallbacks(it) }
     removeShield()
     super.onDestroy()
   }
@@ -86,7 +122,7 @@ class ChewyBlockerService : AccessibilityService() {
       card.addView(label("A little pause", 29, Color.rgb(28, 44, 51), true).apply {
         setPadding(0, dp(18), 0, dp(10))
       })
-      card.addView(label("You chose to take a break from this app. What would you like to do instead?", 16, Color.rgb(86, 105, 110), false).apply {
+      card.addView(label("Your app boundary is active. What would you like to do next?", 16, Color.rgb(86, 105, 110), false).apply {
         setPadding(0, 0, 0, dp(24))
       })
       card.addView(action("Go to Home") {
@@ -99,6 +135,14 @@ class ChewyBlockerService : AccessibilityService() {
           it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
           startActivity(it)
         }
+      })
+      val accessMinutes = ChewyRules.load(this).accessWindowMinutes
+      if (accessMinutes > 0) card.addView(action("Use for $accessMinutes minutes", true) {
+        val until = System.currentTimeMillis() + accessMinutes * 60_000L
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+          .putString(BYPASS_PACKAGE, target).putLong(BYPASS_UNTIL, until).apply()
+        removeShieldNow()
+        main.postDelayed({ if (foregroundPackage == target) evaluate(target) }, until - System.currentTimeMillis() + 50)
       })
 
       val params = WindowManager.LayoutParams(
@@ -176,6 +220,9 @@ class ChewyBlockerService : AccessibilityService() {
     const val ENABLED = "enabled"
     const val BLOCKED_PACKAGES = "blocked_packages"
     const val PAUSE_EVENTS = "pause_events"
+    const val FOCUS_BLOCK_UNTIL = "focus_block_until"
+    const val BYPASS_PACKAGE = "bypass_package"
+    const val BYPASS_UNTIL = "bypass_until"
 
     fun isProtectedPackage(context: Context, candidate: String): Boolean {
       if (candidate == context.packageName) return true

@@ -4,7 +4,10 @@ import Svg, {Circle, Ellipse, G, Path} from 'react-native-svg';
 import {Text, appFontFamily} from './AppText';
 import {blocker, emptyStatus} from './native/blocker';
 import type {BlockerStatus, LaunchableApp} from './native/blocker';
-import {cartoon, colors} from './theme';
+import {DEFAULT_BLOCK_RULES, type BlockRules} from './blockRules';
+import {RulesPanel} from './RulesPanel';
+import {boundaryState} from './blockStatus';
+import {cartoon, colors, themePalettes, type ThemeMode} from './theme';
 
 type AppFilter = 'all' | 'social' | 'video';
 
@@ -86,9 +89,10 @@ function QuickPickArt({kind}: {kind: 'social' | 'video' | 'custom'}) {
   </Svg>;
 }
 
-export function BlockScreen({visible = true}: {visible?: boolean}) {
+export function BlockScreen({theme = 'day', visible = true}: {theme?: ThemeMode; visible?: boolean}) {
   const [apps, setApps] = useState<LaunchableApp[]>([]);
   const [status, setStatus] = useState<BlockerStatus>(emptyStatus);
+  const [rules, setRules] = useState<BlockRules>(DEFAULT_BLOCK_RULES);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<AppFilter>('all');
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -99,9 +103,10 @@ export function BlockScreen({visible = true}: {visible?: boolean}) {
   const refresh = useCallback(async () => {
     if (!blocker) return;
     try {
-      const [nextApps, nextStatus] = await Promise.all([blocker.getLaunchableApps(), blocker.getStatus()]);
+      const [nextApps, nextStatus, rawRules] = await Promise.all([blocker.getLaunchableApps(), blocker.getStatus(), blocker.getRules()]);
       setApps(nextApps);
       setStatus(nextStatus);
+      setRules(JSON.parse(rawRules) as BlockRules);
       setError('');
       setReady(true);
     } catch (reason) { setError(String(reason)); }
@@ -110,8 +115,23 @@ export function BlockScreen({visible = true}: {visible?: boolean}) {
   useEffect(() => {
     refresh();
     const subscription = AppState.addEventListener('change', state => { if (state === 'active') refresh(); });
-    return () => subscription.remove();
-  }, [refresh]);
+    const timer = setInterval(() => { if (visible) blocker?.getStatus().then(setStatus).catch(() => {}); }, 30000);
+    return () => {subscription.remove(); clearInterval(timer);};
+  }, [refresh, visible]);
+
+  async function saveRules(next: BlockRules): Promise<boolean> {
+    if (!blocker || busy) return false;
+    setBusy(true);
+    try {
+      await blocker.saveRules(JSON.stringify(next));
+      setRules(next);
+      setStatus(await blocker.getStatus());
+      return true;
+    } catch (reason) {
+      Alert.alert('Could not save rule', String(reason));
+      return false;
+    } finally { setBusy(false); }
+  }
 
   async function togglePackage(packageName: string) {
     if (!blocker || busy) return;
@@ -121,7 +141,7 @@ export function BlockScreen({visible = true}: {visible?: boolean}) {
     setBusy(true);
     try {
       await blocker.saveBlockedPackages(next);
-      setStatus(current => ({...current, blockedPackages: next}));
+      setStatus(await blocker.getStatus());
     } catch (reason) { Alert.alert('Could not save your apps', String(reason)); }
     finally { setBusy(false); }
   }
@@ -153,30 +173,33 @@ export function BlockScreen({visible = true}: {visible?: boolean}) {
   const selectedApps = apps.filter(app => status.blockedPackages.includes(app.packageName));
   const shownSelectedApps = selectedApps.slice(0, selectedApps.length > 4 ? 3 : 4);
   const blockingNow = status.blockingEnabled && status.accessibilityEnabled;
+  const boundary = boundaryState(status, Boolean(blocker));
+  const anyBlocking = boundary.active;
   const filteredApps = apps.filter(app => {
     const name = `${app.label} ${app.packageName}`.toLowerCase();
     return name.includes(search.toLowerCase()) && (filter === 'all' || filters[filter].some(term => name.includes(term)));
   }).sort((a, b) => Number(status.blockedPackages.includes(b.packageName)) - Number(status.blockedPackages.includes(a.packageName)) || a.label.localeCompare(b.label));
 
-  if (blocker && !ready) return <View style={styles.loadingScreen}>
+  if (blocker && !ready) return <View style={[styles.loadingScreen, {backgroundColor: themePalettes[theme].screen}]}>
     {error ? <><Text style={styles.loadingTitle}>Couldn’t load your boundaries</Text><Pressable onPress={refresh} accessibilityRole="button"><Text style={styles.serviceLink}>Try again  →</Text></Pressable></> : <><ActivityIndicator color={colors.green} /><Text style={styles.loadingTitle}>Checking your boundaries…</Text></>}
   </View>;
 
   return <>
-    <ScrollView style={styles.screen} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+    <ScrollView style={[styles.screen, {backgroundColor: themePalettes[theme].screen}]} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
       <View style={styles.header}><View><Text style={styles.eyebrow}>YOUR BOUNDARIES</Text><Text style={styles.title}>Block</Text></View><Pressable style={styles.addButton} onPress={() => openPicker()} accessibilityRole="button"><SelectionIcon selected={false} /><Text style={styles.addButtonText}>Add apps</Text></Pressable></View>
 
       <Text style={styles.sectionLabel}>Blocking now</Text>
       <View style={styles.blockCard}>
         <View style={styles.blockCardTop}>
-          <AlarmClockBadge active={blockingNow && visible} />
-          <View style={styles.blockCardCopy}><Text style={styles.blockCardTitle}>Chewy shield</Text><Text style={styles.blockCardSubtitle}>{blockingNow ? 'All day' : selectedApps.length ? 'Off for now' : 'Choose apps to begin'}</Text></View>
-          <Pressable style={[styles.statePill, blockingNow && styles.activePill]} onPress={() => toggleEnabled(!blockingNow)} disabled={!blocker || busy} accessibilityRole="switch" accessibilityLabel="Block selected apps" accessibilityState={{checked: blockingNow, disabled: !blocker || busy}}>
-            <View style={[styles.stateDot, blockingNow && styles.activeDot]} /><Text style={[styles.stateText, blockingNow && styles.activeText]}>{blockingNow ? 'Active' : 'Off'}</Text>
+          <AlarmClockBadge active={anyBlocking && visible} />
+          <View style={styles.blockCardCopy}><Text style={styles.blockCardTitle}>Chewy shield</Text><Text style={styles.blockCardSubtitle}>{boundary.label}</Text></View>
+          <Pressable style={[styles.statePill, blockingNow && styles.activePill]} onPress={() => toggleEnabled(!blockingNow)} disabled={!blocker || busy} accessibilityRole="switch" accessibilityLabel="All-day blocking" accessibilityState={{checked: blockingNow, disabled: !blocker || busy}}>
+            <View style={[styles.stateDot, blockingNow && styles.activeDot]} /><Text style={[styles.stateText, blockingNow && styles.activeText]}>{blockingNow ? 'All day on' : 'All day off'}</Text>
           </Pressable>
         </View>
         <Pressable style={styles.selectedStrip} onPress={() => openPicker()} accessibilityRole="button" accessibilityLabel="Choose apps to pause"><Text style={styles.selectedStripLabel}>Apps to pause</Text><View style={styles.selectedTiles}>{shownSelectedApps.map(app => <AppTile key={app.packageName} app={app} />)}{selectedApps.length > 4 && <View style={styles.moreTile}><Text style={styles.moreTileText}>+{selectedApps.length - 3}</Text></View>}{selectedApps.length === 0 && <Text style={styles.selectAppsHint}>Choose apps  ›</Text>}</View></Pressable>
       </View>
+      {status.focusBlocking && <Text style={styles.privacyNote}>Focus is pausing your selected apps until the timer ends. The switch above controls all-day blocking separately.</Text>}
 
       {!status.accessibilityEnabled && blocker && <View style={styles.serviceCard}><View style={styles.serviceIcon}><Text style={styles.serviceIconText}>✦</Text></View><View style={styles.serviceCopy}><Text style={styles.serviceTitle}>One step to start blocking</Text><Text style={styles.serviceBody}>Enable Chewy’s Android service to show your pause screen.</Text><Pressable onPress={() => blocker?.openAccessibilitySettings()} accessibilityRole="button"><Text style={styles.serviceLink}>Enable service  →</Text></Pressable></View></View>}
       {!blocker && <Text style={styles.notice}>App blocking is available in the Android build.</Text>}
@@ -192,10 +215,11 @@ export function BlockScreen({visible = true}: {visible?: boolean}) {
       <Text style={styles.sectionLabel}>Your list</Text>
       <Pressable style={styles.listCard} onPress={() => openPicker()} accessibilityRole="button"><View style={styles.listHeader}><View><Text style={styles.listTitle}>My paused apps</Text><Text style={styles.listSubtitle}>{selectedApps.length === 0 ? 'No apps added yet' : `${selectedApps.length} ${selectedApps.length === 1 ? 'app' : 'apps'} in your list`}</Text></View><View style={styles.editPill}><Text style={styles.editPillText}>{selectedApps.length ? 'Edit' : 'Add'}</Text></View></View><View style={styles.listTiles}>{selectedApps.length ? selectedApps.slice(0, 6).map(app => <AppTile key={app.packageName} app={app} />) : <Text style={styles.emptyHint}>Tap to choose the apps you want to pause.</Text>}</View></Pressable>
       <Text style={styles.privacyNote}>Your choices stay on this device. Chewy only checks which app is in the foreground.</Text>
+      {blocker && <><Text style={styles.sectionLabel}>Your rules</Text><RulesPanel rules={rules} busy={busy} usageAccessGranted={status.usageAccessGranted} onSave={saveRules} onOpenUsageAccess={() => blocker?.openUsageAccessSettings().catch(reason => Alert.alert('Usage Access', String(reason)))} /></>}
     </ScrollView>
 
     <Modal visible={pickerOpen} animationType="slide" onRequestClose={() => setPickerOpen(false)}>
-      <View style={styles.pickerScreen}><View style={styles.pickerHeader}><View><Text style={styles.eyebrow}>YOUR LIST</Text><Text style={styles.pickerTitle}>Choose apps</Text></View><Pressable style={styles.doneButton} onPress={() => setPickerOpen(false)} accessibilityRole="button"><Text style={styles.doneText}>Done</Text></Pressable></View>
+      <View style={[styles.pickerScreen, {backgroundColor: themePalettes[theme].screen}]}><View style={styles.pickerHeader}><View><Text style={styles.eyebrow}>YOUR LIST</Text><Text style={styles.pickerTitle}>Choose apps</Text></View><Pressable style={styles.doneButton} onPress={() => setPickerOpen(false)} accessibilityRole="button"><Text style={styles.doneText}>Done</Text></Pressable></View>
         <Text style={styles.pickerHint}>Tap an app to add or remove it from your pause list.</Text>
         <View style={styles.filterRow}>{(['all', 'social', 'video'] as AppFilter[]).map(item => <Pressable key={item} style={[styles.filterChip, filter === item && styles.filterChipActive]} onPress={() => setFilter(item)}><Text style={[styles.filterText, filter === item && styles.filterTextActive]}>{item === 'all' ? 'All apps' : item === 'social' ? 'Social' : 'Video'}</Text></Pressable>)}</View>
         <TextInput style={styles.search} placeholder="Search installed apps" placeholderTextColor={colors.muted} value={search} onChangeText={setSearch} autoCorrect={false} />
